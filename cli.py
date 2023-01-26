@@ -26,7 +26,7 @@ async def make_client(args):
 
 parser.add_argument('--host', default="255.255.255.255")
 parser.add_argument('--port', default="1338", type=int)
-parser.add_argument('--timeout', type=float, default=3.0)
+parser.add_argument('--timeout', type=float, default=10.0)
 parser.add_argument('--loglevel', default="INFO")
 
 args = parser.parse_args()
