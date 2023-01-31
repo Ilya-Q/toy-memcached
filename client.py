@@ -40,8 +40,15 @@ class Client:
             while True:
                 host, info = await pr.q.get()
                 logger.debug(f"Found node {json.dumps(info)} at {host}")
-                # TODO: check if there was a different node at this host:port pair previously
-                # or maybe just rebuild the cluster from scratch?
+                prev_node = self._get_node_at(host, info["port"])
+                if prev_node is not None:
+                    _, prev_info = prev_node
+                    if prev_info["id"] != info["id"] or prev_info["is_leader"] != info["is_leader"]:
+                        logger.info(f"replacing node {json.dumps(prev_info)} at {host}:{info['port']} with {json.dumps(info)}")
+                        self._retire(prev_info["id"])
+                else:
+                    logger.info(f"Node {json.dumps(info)} newly discovered")
+
                 if info["is_leader"]:
                     self.leader = (host, info)
                 else:
@@ -54,15 +61,15 @@ class Client:
             # TODO: make exceptions more specific
             raise Exception("No node available to serve this request")
         host, info = node
+        logger.debug(f"issueing request to leader: {info['is_leader']}")
         try:
-
             r, w = await asyncio.open_connection(host, info["port"])
-        except ConnectionRefusedError as e:
+        except Exception as e:
             # no one's listening
-            logger.error(f"Node {node['id']} is no longer available at {host}:{info['port']}")
-            self._retire(node["id"])
+            logger.error(f"Node {info['id']} is no longer available at {host}:{info['port']}")
+            self._retire(info["id"])
             # TODO: try again with another node?
-            raise(e)
+            return await self._issue_req(req, self._get_node_for_request(req))
         await req.write(w)
         resp = await protocol.Response.read(r)
         if resp.status == protocol.Status.OK:
@@ -89,8 +96,26 @@ class Client:
 
     def _retire(self, id: str):
         if id in self.followers:
-            del self.followers["id"]
+            del self.followers[id]
         elif self.leader is not None:
             _, info = self.leader
             if info["id"] == id:
                 self.leader = None
+
+    def _get_node_at(self, host, port):
+        if self.leader is not None:
+            h, info = self.leader
+            if h == host and info["port"] == port:
+                return self.leader
+        for (h, info) in self.followers.values():
+            if h == host and info["port"] == port:
+                return (h, info)
+        return None
+    
+    def _get_node_for_request(self, req: protocol.Request, latest=False):
+        if req.action == protocol.Action.READ:
+            return self.leader if latest or len(self.followers) == 0 else random.choice(list(self.followers.values()))
+        elif req.action == protocol.Action.WRITE:
+            return self.leader
+        else:
+            raise(Exception("Request Action was undefined"))
