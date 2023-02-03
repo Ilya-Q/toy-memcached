@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 # TODO: probably a good idea to move all of this groupview business to middleware.py
 
 @dataclasses.dataclass
+class ElectionParticipant:
+    id: str
+    host: str
+
+@dataclasses.dataclass
 class Follower:
     id: str
     clock: int
@@ -48,19 +53,19 @@ class GroupView:
 
     async def do_replication(self, id, stream):
         f = self.followers[id]
-        assert(f._t is None)
+        assert(f._t is None and type(f._q) != type("hi"))
         f._t = asyncio.create_task(self._queue_worker(f, stream), name=f"replication:{id}")
         try:
             await f._t
         except Exception as e:
-            logger.exception(f"Replication to {id} failed")
+            logger.error(f"Replication to {id} failed: {e}")
+            ex = f._t.exception()
+            assert(ex is not None)
+            logger.error(f"Replication task failed with {ex}")
+            r, w = stream 
+            w.close()
             f._t = None
             self.drop_follower(id)
-        # e = f._t.exception()
-        # assert(e is not None) # replication can *only* stop because of an error
-        # logger.error(f"Replication to {id} failed: {e}")
-        # f._t = None
-        # self.drop_follower(id)
 
 
     async def _queue_worker(self, f: Follower, stream: Tuple[asyncio.StreamReader, asyncio.StreamWriter]):
@@ -90,15 +95,17 @@ class GroupView:
         
 
 class StorageNode:
-    def __init__(self, *, node_id: Optional[uuid.UUID] = None, is_leader=True, host="0.0.0.0", port=1337, discovery_host="255.255.255.255", discovery_port=1338, replication_port=1339):
+    election_port = 4000
+    def __init__(self, *, node_id: Optional[str] = None, is_leader=True, host="0.0.0.0", port=1337, discovery_host="255.255.255.255", discovery_port=1338, replication_port=1444):
         if node_id is None:
-            self.id = uuid.uuid4()
+            self.id = str(uuid.uuid4())
             logger.warning("UUID generated randomly")
         else:
             self.id = node_id
         self.store: Optional[ChainMap] = None
+        self.election_ring : List[ElectionParticipant] = [ElectionParticipant(self.id, host)]
         # TODO: figure out if we should be the leader or not automatically
-        self.is_leader: bool = is_leader
+        self.is_leader: bool = False
         self.host: str = host
         self.port: int = port
         self.replication_port: int = replication_port
@@ -115,6 +122,7 @@ class StorageNode:
         # these should probably be abstracted away in some way
         self.unstable: Optional[List[protocol.Request]] = None
         self.unstable_clock: Optional[int] = None
+        self.first_start = True
 
     def describe(self):
         return {
@@ -126,26 +134,76 @@ class StorageNode:
             "clock": self.clock
         }
 
-    async def _find_leader(self, timeout: float):
+    async def _setup_election_listener(self):
+        loop = asyncio.get_running_loop()
+        return await loop.create_datagram_endpoint(
+                    lambda: middleware.ElectionProtocol(self.id,self, True, True, []),
+                    local_addr=(self.host, StorageNode.election_port),
+                    allow_broadcast=True
+                )
+    
+    # execute LeLann-Chang-Roberts (LCR) algorithm to find our new leader
+    async def _hold_election(self, listener, timeout = 10.0):
+        # find the neighbour on our right-hand side
+        next_node: ElectionParticipant = None
+        i = -1
+        for i, participant in enumerate(self.election_ring):
+            if participant.id == self.id: 
+                next_node = self.election_ring[0] if i == len(self.election_ring)-1 else self.election_ring[i+1]
+        logger.debug(f"right-hand neighbour is {next_node.id}")
+        # we only really need the ring to find our neighbour so it should be reset now for the next election
+        self.election_ring : List[ElectionParticipant] = [ElectionParticipant(self.id, self.host)]
+
+        # send and listen for election messages
         loop = asyncio.get_running_loop()
         tr, pr = await loop.create_datagram_endpoint(
-            lambda: middleware.DiscoveryProtocol(),
-            remote_addr=(self.discovery_host, self.discovery_port),
-            allow_broadcast=True
-        )
-        async def wait():
-            while True:
-                host, info = await pr.q.get()
-                if info.get("is_leader"):
-                    return host, info
-        t = asyncio.create_task(wait())
+                    lambda: middleware.ElectionProtocol.from_listener(listener),
+                    remote_addr=(next_node.host, StorageNode.election_port),
+                    local_addr=(self.host, StorageNode.election_port),
+                    allow_broadcast=True
+                )
+
+        t = asyncio.create_task(pr.get_leader())
         try:
             await asyncio.wait_for(t, timeout=timeout)
         except Exception as e:
-            raise(e)
+            logger.warn(f"The election ran into a timeout")
         finally:
             tr.close()
         return t.result()
+    
+
+    # TODO: use custom protocols, right now the nodes are flooding each other
+    async def _find_leader_and_build_election_ring(self, timeout: float) -> Tuple[str,Dict]:
+        loop = asyncio.get_running_loop()
+        tr, pr = await loop.create_datagram_endpoint(
+                    lambda: middleware.DiscoveryProtocol(),
+                    remote_addr=(self.discovery_host, self.discovery_port),
+                    allow_broadcast=True
+                )
+        async def wait():
+            while True:
+                host, info = await pr.q.get()
+                logger.debug(f"heard node {info['id']}")
+                if len(list(filter(lambda participant: participant.id == info["id"], self.election_ring))) == 0:
+                    self.election_ring.append(ElectionParticipant(info["id"], host))
+                if info.get("is_leader"):
+                    logger.info(f"leader is {info['id']}")
+                    return host, info
+                pr.send_request()
+        t = asyncio.create_task(wait())
+        leader = None
+        try:
+            await asyncio.wait_for(t, timeout=timeout)
+            leader = t.result()
+            logger.info(f"Node with id {leader[0]} is leader")
+            self.election_ring = [ElectionParticipant(self.id, self.host)]
+        except Exception as e:
+            self.election_ring.sort(key=lambda participant: participant.id)
+            logger.info(f"No leader found, election ring contains the following participants: {self.election_ring}")
+        finally:
+            tr.close()
+        return leader
 
     async def _start_announcing(self):
         loop = asyncio.get_running_loop()
@@ -154,37 +212,52 @@ class StorageNode:
             local_addr=(self.host, self.discovery_port),
             allow_broadcast=True
         )
+    
+
 
     async def start(self):
         logger.info(f"Starting server {self.id} as {'leader' if self.is_leader else 'follower'}")
+        if self.discovery_pair == None:
+            await self._start_announcing()
         logger.info(f"Looking for existing leader")
-        leader = None
-        try:
-            # TODO: configurable timeout
-            leader = await self._find_leader(5.0)
-        except asyncio.TimeoutError:
-            pass
+        # listen for election messages, other nodes might start the real process before we do but we must not miss any messages
+        listener_transport, listener = await self._setup_election_listener()
+        leader = await self._find_leader_and_build_election_ring(5.0)
+        listener_transport.close()
+        await asyncio.sleep(2)
         if leader is None:
-            if not self.is_leader:
-                logger.error("No leader found, aborting")
+            leader = await self._hold_election(listener)
+            if leader is None:
+                logger.error("I can not live without a leader...")
                 return
-            logger.info("No leader found, bootstrapping ourselves as leader")
-            self.store = ChainMap()
-            self.clock = 0
-            self.groupview = GroupView(clock=0)
+
+        leader_host, leader_info = leader
+        self.is_leader = leader_info["id"] == self.id 
+        if not self.is_leader:
+            n_tries = 0
+            while n_tries < 7:
+                try:
+                    replication_stream = await asyncio.open_connection(leader_host, leader_info["replication_port"])
+                    await self._attach(replication_stream)
+                    logger.info(f"replicating from {leader_host}:{leader_info['replication_port']} succeeded")
+                    break
+                except Exception as e:
+                    logger.error(f"replicating from {leader_host}:{leader_info['replication_port']} failed")
+                    logger.error(f"e: {e}")
+                    n_tries += 1
+                    await asyncio.sleep(1)
+
+        else:
+            if self.first_start:
+                self.store = ChainMap()
+                self.clock = 0
+            self.groupview = GroupView(clock=self.clock)
             self.replication_server = await asyncio.start_server(self._handle_replication, self.host, self.replication_port)
             logger.info(f"Started replication server on {self.host}:{self.replication_port}")
-        else:
-            leader_host, leader_info = leader
-            if self.is_leader:
-                logger.error(f"Leader {leader_info.get('id')} already present at {leader_host}, aborting")
-                return
-            replication_stream = await asyncio.open_connection(leader_host, leader_info["replication_port"])
-            await self._attach(replication_stream)
-        self.server = await asyncio.start_server(self._handle_req, self.host, self.port)
-        logger.info(f"Listening on {self.host}:{self.port}")
-        await self._start_announcing()
-        await self.server.serve_forever()
+        if self.server == None:
+            self.server = await asyncio.start_server(self._handle_req, self.host, self.port)
+            logger.info(f"Listening on {self.host}:{self.port}")
+            await self.server.serve_forever()
 
     async def _attach(self, stream: Tuple[asyncio.StreamReader, asyncio.StreamWriter]):
         r, w = stream
@@ -197,11 +270,13 @@ class StorageNode:
         await w.drain()
         # TODO: detect the failure of the leader by catching an exception from this task
         self.replication_t = asyncio.create_task(self._replicate_from(stream))
+        self.replication_t.add_done_callback(self.follower_replication_failed_handler)
     
     async def _replicate_from(self, stream: Tuple[asyncio.StreamReader, asyncio.StreamWriter]):
         r, w = stream
         while True:
-            min_clock = int(await r.readline())
+            line = await r.readline()
+            min_clock = int(line)
             clock_diff = min_clock - self.unstable_clock
             assert(clock_diff >= 0)
             if clock_diff > 0:
@@ -221,6 +296,11 @@ class StorageNode:
                     self.unstable.append(req)
             w.write(b'ACK\n')
             await w.drain()
+
+    def follower_replication_failed_handler(self, _):
+        logger.warn("replication failed")
+        logger.error(self.replication_t.exception())
+        asyncio.create_task(self.start())
 
     async def _handle_req(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         try:
