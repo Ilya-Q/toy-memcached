@@ -119,6 +119,7 @@ class StorageNode:
         self.replication_t: Optional[asyncio.Task] = None
         self.groupview: Optional[GroupView] = None
         self.clock: Optional[int] = None
+        self.follower_replication_stream : Tuple[asyncio.StreamReader, asyncio.StreamWriter] = None
         # these should probably be abstracted away in some way
         self.unstable: Optional[List[protocol.Request]] = None
         self.unstable_clock: Optional[int] = None
@@ -234,11 +235,12 @@ class StorageNode:
         leader_host, leader_info = leader
         self.is_leader = leader_info["id"] == self.id 
         if not self.is_leader:
+            self.clock = None
             n_tries = 0
             while n_tries < 7:
                 try:
-                    replication_stream = await asyncio.open_connection(leader_host, leader_info["replication_port"])
-                    await self._attach(replication_stream)
+                    self.follower_replication_stream = await asyncio.open_connection(leader_host, leader_info["replication_port"])
+                    await self._attach(self.follower_replication_stream)
                     logger.info(f"replicating from {leader_host}:{leader_info['replication_port']} succeeded")
                     break
                 except Exception as e:
@@ -300,6 +302,8 @@ class StorageNode:
     def follower_replication_failed_handler(self, _):
         logger.warn("replication failed")
         logger.error(self.replication_t.exception())
+        r, w = self.follower_replication_stream
+        w.close()
         asyncio.create_task(self.start())
 
     async def _handle_req(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
