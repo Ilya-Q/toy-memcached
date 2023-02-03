@@ -123,13 +123,15 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             self.q = asyncio.Queue()
             self.req_id = str(uuid.uuid4())
             self.group_id = group_id
-        def connection_made(self, transport):
-            self.transport = transport
+        def send_request(self):
             req = {}
             req["req_id"] = self.req_id
             if self.group_id is not None:
                 req["group_id"] = self.group_id
             self.transport.sendto(json.dumps(req).encode())
+        def connection_made(self, transport):
+            self.transport = transport
+            self.send_request()
         def datagram_received(self, data, addr):
             try:
                 response = json.loads(data)
