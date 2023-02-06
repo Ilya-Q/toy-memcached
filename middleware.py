@@ -8,6 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class Describable(Protocol):
+    id: str
     def describe(self) -> dict:
         ...
 
@@ -91,9 +92,10 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             self._handle_win((leader_host, leader_info))
 
 class DiscoverabilityProtocol(asyncio.DatagramProtocol):
-    def __init__(self, discoverable: Describable, group_ids: Optional[Set[str]] = None):
-        self.discoverable = discoverable
+    def __init__(self, describable: Describable, group_ids: Optional[Set[str]] = None):
+        self.describable = describable
         self.group_ids = group_ids
+        self.q : asyncio.Queue = None
     def connection_made(self, transport):
         self.transport = transport
     def datagram_received(self, data, addr):
@@ -103,12 +105,14 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
             logger.exception(f"Couldn't parse discovery request")
             raise e
         group_id = req.get("group_id")
-        if (group_id is not None 
+        if ((group_id is not None 
             and self.group_ids is not None
-            and group_id not in self.group_ids):
+            and group_id not in self.group_ids) 
+            or (req["info"] != None 
+            and req["info"]["id"] == self.describable.id)):
             return
         req_id = req.get("req_id")
-        info = self.discoverable.describe()
+        info = self.describable.describe()
         try:
             msg = json.dumps({"req_id":req_id, "info":info})
             msg = msg.encode()
@@ -116,22 +120,30 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
             logger.exception(f"Couldn't serialize discovery response")
             raise e
         self.transport.sendto(msg, addr)
-        #self.transport.close()
+
+        # when used for ringbuilding we dont just want to discover, we also want to know the others
+        if self.q != None:
+            host, _ = addr
+            self.q.put_nowait((host, req["info"]))
+    # necessary for ringbuilding
+    def setQueue(self, q: asyncio.Queue):
+        self.q = q
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
-        def __init__(self, group_id: Optional[str] = None):
+        def __init__(self, group_id: Optional[str] = None, describable: Describable = None):
             self.q = asyncio.Queue()
             self.req_id = str(uuid.uuid4())
             self.group_id = group_id
-        def send_request(self):
+            self.describable = describable
+        def connection_made(self, transport):
+            self.transport = transport
             req = {}
             req["req_id"] = self.req_id
             if self.group_id is not None:
                 req["group_id"] = self.group_id
+            if self.describable != None:
+                req["info"] = self.describable.describe()
             self.transport.sendto(json.dumps(req).encode())
-        def connection_made(self, transport):
-            self.transport = transport
-            self.send_request()
         def datagram_received(self, data, addr):
             try:
                 response = json.loads(data)

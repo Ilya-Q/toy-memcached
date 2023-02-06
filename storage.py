@@ -113,7 +113,7 @@ class StorageNode:
         self.discovery_port: str = discovery_port
         # unfortunately there's no such thing as a UDP server in asyncio
         # but we still need to keep a reference to the transport and protocol somewhere so they don't get collected
-        self.discovery_pair: Optional[Tuple[asyncio.Transport, asyncio.Protocol]] = None
+        self.discoverability_pair: Optional[Tuple[asyncio.Transport, asyncio.Protocol]] = None
         self.server: Optional[asyncio.Server] = None
         self.replication_server: Optional[asyncio.Server] = None
         self.replication_t: Optional[asyncio.Task] = None
@@ -178,20 +178,23 @@ class StorageNode:
     async def _find_leader_and_build_election_ring(self, timeout: float) -> Tuple[str,Dict]:
         loop = asyncio.get_running_loop()
         tr, pr = await loop.create_datagram_endpoint(
-                    lambda: middleware.DiscoveryProtocol(),
+                    lambda: middleware.DiscoveryProtocol(describable=self),
                     remote_addr=(self.discovery_host, self.discovery_port),
                     allow_broadcast=True
                 )
+        
+        _, discoverability_pr = self.discoverability_pair
+        discoverability_pr.setQueue(pr.q)
+
         async def wait():
             while True:
                 host, info = await pr.q.get()
-                logger.debug(f"heard node {info['id']}")
-                if len(list(filter(lambda participant: participant.id == info["id"], self.election_ring))) == 0:
+                if (info["id"] != self.id and len(list(filter(lambda participant: participant.id == info["id"], self.election_ring))) == 0):
                     self.election_ring.append(ElectionParticipant(info["id"], host))
+                    logger.info(f"added node {info['id']} to election participants")
                 if info.get("is_leader"):
                     logger.info(f"leader is {info['id']}")
                     return host, info
-                pr.send_request()
         t = asyncio.create_task(wait())
         leader = None
         try:
@@ -203,13 +206,14 @@ class StorageNode:
             self.election_ring.sort(key=lambda participant: participant.id)
             logger.info(f"No leader found, election ring contains the following participants: {self.election_ring}")
         finally:
+            discoverability_pr.setQueue(None)
             tr.close()
         return leader
 
     async def _start_announcing(self):
         loop = asyncio.get_running_loop()
-        self.discovery_pair = await loop.create_datagram_endpoint(
-            lambda: middleware.DiscoverabilityProtocol(self),
+        self.discoverability_pair = await loop.create_datagram_endpoint(
+            lambda: middleware.DiscoverabilityProtocol(describable=self),
             local_addr=(self.host, self.discovery_port),
             allow_broadcast=True
         )
@@ -218,7 +222,7 @@ class StorageNode:
 
     async def start(self):
         logger.info(f"Starting server {self.id} as {'leader' if self.is_leader else 'follower'}")
-        if self.discovery_pair == None:
+        if self.discoverability_pair == None:
             await self._start_announcing()
         logger.info(f"Looking for existing leader")
         # listen for election messages, other nodes might start the real process before we do but we must not miss any messages
