@@ -260,6 +260,7 @@ class StorageNode:
             self.groupview = GroupView(clock=self.clock)
             self.replication_server = await asyncio.start_server(self._handle_replication, self.host, self.replication_port)
             logger.info(f"Started replication server on {self.host}:{self.replication_port}")
+        self.first_start = False
         if self.server == None:
             self.server = await asyncio.start_server(self._handle_req, self.host, self.port)
             logger.info(f"Listening on {self.host}:{self.port}")

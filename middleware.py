@@ -108,7 +108,7 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
         if ((group_id is not None 
             and self.group_ids is not None
             and group_id not in self.group_ids) 
-            or (req["info"] != None 
+            or (req.get("info") != None 
             and req["info"]["id"] == self.describable.id)):
             return
         req_id = req.get("req_id")
@@ -124,7 +124,7 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
         # when used for ringbuilding we dont just want to discover, we also want to know the others
         if self.q != None:
             host, _ = addr
-            self.q.put_nowait((host, req["info"]))
+            self.q.put_nowait((host, req.get("info")))
     # necessary for ringbuilding
     def setQueue(self, q: asyncio.Queue):
         self.q = q
