@@ -165,18 +165,21 @@ class StorageNode:
                     allow_broadcast=True
                 )
 
-        t = asyncio.create_task(pr.get_leader())
+        get_leader_task = asyncio.create_task(pr.get_leader())
         try:
-            await asyncio.wait_for(t, timeout=timeout)
+            await asyncio.wait_for(get_leader_task, timeout=timeout)
         except Exception as e:
             logger.warn(f"The election ran into a timeout")
         finally:
             tr.close()
-        return t.result()
+
+        if get_leader_task.cancelled():
+            return None
+        return get_leader_task.result()
     
 
     # TODO: use custom protocols, right now the nodes are flooding each other
-    async def _find_leader_and_build_election_ring(self, timeout: float) -> Tuple[str,Dict]:
+    async def _find_leader_and_build_election_ring(self, timeout: float, listener: ElectionParticipant) -> Tuple[str,Dict]:
         loop = asyncio.get_running_loop()
         tr, pr = await loop.create_datagram_endpoint(
                     lambda: middleware.DiscoveryProtocol(describable=self),
@@ -197,13 +200,19 @@ class StorageNode:
                     logger.info(f"leader is {info['id'][0:5]}")
                     return host, info
         t = asyncio.create_task(wait())
+        
         leader = None
         try:
-            await asyncio.wait_for(t, timeout=timeout)
+            wait_task = asyncio.create_task(asyncio.wait_for(t, timeout=timeout))
+            listener.register_election_message_received_callback(wait_task.cancel)
+            await wait_task
             leader = t.result()
             logger.info(f"Node with id {leader[1]['id'][0:5]} is leader")
             self.election_ring = [ElectionParticipant(self.id, self.host)]
-        except Exception as e:
+        except asyncio.exceptions.TimeoutError as e:
+            self.election_ring.sort(key=lambda participant: participant.id)
+            logger.info(f"No leader found, election ring contains the following participants: {self.election_ring}")
+        except asyncio.exceptions.CancelledError as e:
             self.election_ring.sort(key=lambda participant: participant.id)
             logger.info(f"No leader found, election ring contains the following participants: {self.election_ring}")
         finally:
@@ -225,17 +234,21 @@ class StorageNode:
         logger.info(f"Starting server {self.id} as {'leader' if self.is_leader else 'follower'}")
         if self.discoverability_pair == None:
             await self._start_announcing()
-        logger.info(f"Looking for existing leader")
-        # listen for election messages, other nodes might start the real process before we do but we must not miss any messages
-        listener_transport, listener = await self._setup_election_listener()
-        leader = await self._find_leader_and_build_election_ring(5.0)
-        listener_transport.close()
-        await asyncio.sleep(2)
-        if leader is None:
-            leader = await self._hold_election(listener)
+        
+        leader = None 
+        while leader is None:
+            logger.info(f"Looking for existing leader")
+            # listen for election messages, other nodes might start the real process before we do but we must not miss any messages
+            listener_transport, listener = await self._setup_election_listener()
+            leader = await self._find_leader_and_build_election_ring(5, listener)
+            listener_transport.close()
+            await asyncio.sleep(1)
             if leader is None:
-                logger.error("I can not live without a leader...")
-                return
+                leader = await self._hold_election(listener)
+                if leader is None:
+                    # after a failed election we wait a bit and then try again
+                    logger.error("election failed, no leader could be found...")
+                    await asyncio.sleep(1)
 
         leader_host, leader_info = leader
         self.is_leader = leader_info["id"] == self.id 

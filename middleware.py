@@ -36,6 +36,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
         self.leader = None
         self.neighbour_unknown = neighbour_unknown
         self.saved_messages = saved_messages
+        self.election_message_received_callback = None
     
     def get_saved_messages(self) -> List[bytes]:
         if not self.neighbour_unknown:
@@ -74,7 +75,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
     def _handle_win(self, leader):
         leader_host, leader_info = leader
         leader_id = leader_info['id']
-        logger.info(f"Node {leader_id} won the election and is now the leader")
+        logger.info(f"Node {leader_id[0:5]} won the election and is now the leader")
         if self.leader == None:
             self.transport.sendto(json.dumps({"type": "VICTORY","id":leader_id, "leader_host":leader_host, "leader_info": leader_info}).encode())
             self.leader = leader
@@ -87,6 +88,9 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             raise e
         incoming_id = message.get("id")
         messageType = message.get("type")
+
+        if incoming_id != self.id and self.election_message_received_callback != None:
+            self.election_message_received_callback()
         incoming_clock = message.get("clock") if message.get("clock") != None else 0
         if messageType == "ELECTION":
             logger.debug(f"got an incoming election message with id {incoming_id}")
@@ -103,9 +107,11 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             leader_host = message["leader_host"] if message["leader_host"] != "0.0.0.0" else addr[0]
             self._handle_win((leader_host, leader_info))
 
+    def register_election_message_received_callback(self, callback):
+        self.election_message_received_callback = callback
+
     def clock(self):
         return self.describable.clock if self.describable.clock != None else 0
-
 class DiscoverabilityProtocol(asyncio.DatagramProtocol):
     def __init__(self, describable: Describable, group_ids: Optional[Set[str]] = None):
         self.describable = describable
@@ -137,7 +143,7 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
         self.transport.sendto(msg, addr)
 
         # when used for ringbuilding we dont just want to discover, we also want to know the others
-        if self.q != None:
+        if self.q != None and req.get("info") != None:
             host, _ = addr
             self.q.put_nowait((host, req.get("info")))
     # necessary for ringbuilding
