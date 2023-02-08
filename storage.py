@@ -31,12 +31,14 @@ class GroupView:
         self.followers: Dict[str, Follower] = {}
         self.max_clock: int = clock # how far ahead is the most up-to-date replica?
         self.min_clock: int = clock # how far behind is the least up-to-date replica?
-    def add_candidate(self, id, clock, host):
+    def add_candidate(self, id, clock, host, missing=[]):
         f = Follower(
             id,
             clock,
             host,
         )
+        for msg in missing:
+            f._q.put_nowait(msg)
         self.followers[id] = f
     def drop_follower(self, id):
         f = self.followers[id]
@@ -58,7 +60,7 @@ class GroupView:
         try:
             await f._t
         except Exception as e:
-            logger.error(f"Replication to {id[0:5]} failed: {e}")
+            logger.exception(f"Replication to {id[0:5]} failed:")
             ex = f._t.exception()
             assert(ex is not None)
             logger.error(f"Replication task failed with {ex}")
@@ -253,7 +255,7 @@ class StorageNode:
         leader_host, leader_info = leader
         self.is_leader = leader_info["id"] == self.id 
         if not self.is_leader:
-            self.clock = None
+            #self.clock = None
             n_tries = 0
             while n_tries < 7:
                 try:
@@ -284,11 +286,12 @@ class StorageNode:
         r, w = stream
         w.write(b"%b\n" % json.dumps(self.describe()).encode())
         await w.drain()
-        await self._read_snapshot(r)
-        self.unstable_clock = self.clock
-        self.unstable = []
-        w.write(b"ACK\n")
-        await w.drain()
+        if self.clock is None:
+            await self._read_snapshot(r)
+            w.write(b"ACK\n")
+            await w.drain()
+            self.unstable_clock = self.clock
+            self.unstable = []
         # TODO: detect the failure of the leader by catching an exception from this task
         self.replication_t = asyncio.create_task(self._replicate_from(stream))
         self.replication_t.add_done_callback(self.follower_replication_failed_handler)
@@ -299,6 +302,7 @@ class StorageNode:
             line = await r.readline()
             min_clock = int(line)
             clock_diff = min_clock - self.unstable_clock
+            logging.debug(f"min_clock={min_clock}, unstable_clock={self.unstable_clock}, clock_diff={clock_diff}")
             assert(clock_diff >= 0)
             if clock_diff > 0:
                 logging.debug(f"About to prune unstable messages: {self.unstable}")
@@ -377,16 +381,23 @@ class StorageNode:
         intro_line = await r.readline()
         intro = json.loads(intro_line)
         logger.info(f"New follower request from {peer}: {intro_line}")
-        self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=self.clock)
-        try:
-            await self._write_snapshot(w)
-            ack_line = await r.readline()
-            assert(ack_line == b'ACK\n')
-        except Exception as e:
-            logger.exception(f"Error while transmitting snapshot to {intro['id']}")
-            self.groupview.drop_follower(intro["id"])
-            raise e
-        logger.info(f"Snapshot sent successfully, starting replication to {peer}")
+        if intro["clock"] is not None:
+            # how many messages are missing?
+            clock_diff = self.clock - intro["clock"]
+            assert(clock_diff >= 0) # if the difference is negative, the election must have gone wrong
+            self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=intro["clock"], missing=self.unstable[-clock_diff:])
+            logger.debug(f"unstable_clock={self.unstable_clock}, unstable={self.unstable}")
+        else:
+            self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=self.clock)
+            try:
+                await self._write_snapshot(w)
+                ack_line = await r.readline()
+                assert(ack_line == b'ACK\n')
+            except Exception as e:
+                logger.exception(f"Error while transmitting snapshot to {intro['id']}")
+                self.groupview.drop_follower(intro["id"])
+                raise e
+            logger.info(f"Snapshot sent successfully, starting replication to {peer}")
         await self.groupview.do_replication(intro["id"], stream=(r,w))
 
     async def do_req(self, req: protocol.Request, replication: bool):
@@ -396,6 +407,7 @@ class StorageNode:
         elif req.action == protocol.Action.WRITE:
             if replication or self.is_leader:
                 self.clock += 1
+                logger.info(f"Clock is now {self.clock}")
                 self.store[req.key] = req.value
                 if self.is_leader:
                     self.groupview.replicate(req)
