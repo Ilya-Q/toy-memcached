@@ -175,7 +175,7 @@ class StorageNode:
     
 
     # TODO: use custom protocols, right now the nodes are flooding each other
-    async def _find_leader_and_build_election_ring(self, timeout: float) -> Tuple[str,Dict]:
+    async def _find_leader_and_build_election_ring(self, timeout: float, listener: ElectionParticipant) -> Tuple[str,Dict]:
         loop = asyncio.get_running_loop()
         tr, pr = await loop.create_datagram_endpoint(
                     lambda: middleware.DiscoveryProtocol(describable=self),
@@ -196,9 +196,13 @@ class StorageNode:
                     logger.info(f"leader is {info['id']}")
                     return host, info
         t = asyncio.create_task(wait())
+        
         leader = None
         try:
-            await asyncio.wait_for(t, timeout=timeout)
+            wait_task = await asyncio.wait_for(t, timeout=timeout)
+            def test():
+                wait_task.cancel(); print("starting early!")
+                listener.register_election_message_received_callback(lambda: test())
             leader = t.result()
             logger.info(f"Node with id {leader[0]} is leader")
             self.election_ring = [ElectionParticipant(self.id, self.host)]
@@ -227,7 +231,7 @@ class StorageNode:
         logger.info(f"Looking for existing leader")
         # listen for election messages, other nodes might start the real process before we do but we must not miss any messages
         listener_transport, listener = await self._setup_election_listener()
-        leader = await self._find_leader_and_build_election_ring(5.0)
+        leader = await self._find_leader_and_build_election_ring(5.0, listener)
         listener_transport.close()
         await asyncio.sleep(2)
         if leader is None:

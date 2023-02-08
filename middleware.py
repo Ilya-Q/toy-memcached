@@ -76,6 +76,10 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             raise e
         incoming_id = message.get("id")
         messageType = message.get("type")
+
+        if incoming_id != self.id and self.election_message_received_callback != None:
+            self.election_message_received_callback()
+
         if messageType == "ELECTION":
             logger.debug(f"got an incoming election message with id {incoming_id}")
             if incoming_id == self.id:
@@ -90,6 +94,9 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             # using the self-reported "0.0.0.0" address leads to errors while replicating so we replace it once when it is seen
             leader_host = message["leader_host"] if message["leader_host"] != "0.0.0.0" else addr[0]
             self._handle_win((leader_host, leader_info))
+
+    def register_election_message_received_callback(self, callback):
+        self.election_message_received_callback = callback
 
 class DiscoverabilityProtocol(asyncio.DatagramProtocol):
     def __init__(self, describable: Describable, group_ids: Optional[Set[str]] = None):
