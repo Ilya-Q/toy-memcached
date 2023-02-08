@@ -58,7 +58,7 @@ class GroupView:
         try:
             await f._t
         except Exception as e:
-            logger.error(f"Replication to {id} failed: {e}")
+            logger.error(f"Replication to {id[0:5]} failed: {e}")
             ex = f._t.exception()
             assert(ex is not None)
             logger.error(f"Replication task failed with {ex}")
@@ -151,7 +151,8 @@ class StorageNode:
         for i, participant in enumerate(self.election_ring):
             if participant.id == self.id: 
                 next_node = self.election_ring[0] if i == len(self.election_ring)-1 else self.election_ring[i+1]
-        logger.debug(f"right-hand neighbour is {next_node.id}")
+        logger.debug(f"right-hand neighbour is {next_node.id[0:5]}")
+        logger.debug(f"clock is {self.clock} UUID starts with {self.id[0:5]}")
         # we only really need the ring to find our neighbour so it should be reset now for the next election
         self.election_ring : List[ElectionParticipant] = [ElectionParticipant(self.id, self.host)]
 
@@ -191,9 +192,9 @@ class StorageNode:
                 host, info = await pr.q.get()
                 if (info["id"] != self.id and len(list(filter(lambda participant: participant.id == info["id"], self.election_ring))) == 0):
                     self.election_ring.append(ElectionParticipant(info["id"], host))
-                    logger.info(f"added node {info['id']} to election participants")
+                    logger.info(f"added node {info['id'][0:5]} to election participants")
                 if info.get("is_leader"):
-                    logger.info(f"leader is {info['id']}")
+                    logger.info(f"leader is {info['id'][0:5]}")
                     return host, info
         t = asyncio.create_task(wait())
         
@@ -204,7 +205,7 @@ class StorageNode:
                 wait_task.cancel(); print("starting early!")
                 listener.register_election_message_received_callback(lambda: test())
             leader = t.result()
-            logger.info(f"Node with id {leader[0]} is leader")
+            logger.info(f"Node with id {leader[1]['id'][0:5]} is leader")
             self.election_ring = [ElectionParticipant(self.id, self.host)]
         except Exception as e:
             self.election_ring.sort(key=lambda participant: participant.id)
@@ -267,7 +268,7 @@ class StorageNode:
         self.first_start = False
         if self.server == None:
             self.server = await asyncio.start_server(self._handle_req, self.host, self.port)
-            logger.info(f"Listening on {self.host}:{self.port}")
+            logger.info(f"Listening for requests on {self.host}:{self.port}")
             await self.server.serve_forever()
 
     async def _attach(self, stream: Tuple[asyncio.StreamReader, asyncio.StreamWriter]):

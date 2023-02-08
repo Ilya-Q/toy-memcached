@@ -9,11 +9,22 @@ logger = logging.getLogger(__name__)
 
 class Describable(Protocol):
     id: str
+    clock: int
     def describe(self) -> dict:
         ...
 
 # even before the ring is fully built we have to listen for election messages, in this case (neighbour_unknown=True) just store them, another instance will process them
 class ElectionProtocol(asyncio.DatagramProtocol):
+    #how the leader should be chosen, currently by clock then by id
+    @staticmethod
+    def is_greater_than(a: Tuple[int, str], b: Tuple[int, str]):
+        if a[0] > b[0]:
+            return True 
+        elif a[0] < b[0]:
+            return False 
+        else:
+            return a[1] > b[1]
+
     @staticmethod
     def from_listener(listener):
         return ElectionProtocol(listener.id, listener.describable, False, False, listener.saved_messages)
@@ -31,13 +42,13 @@ class ElectionProtocol(asyncio.DatagramProtocol):
             raise Exception("neighbour was known so there could not be any messages")
         return self.saved_messages
 
-    def _send_election_message(self, other_id: str):
-        id_to_send = None
-        if other_id == None or other_id < self.id:
-            id_to_send = self.id
+    def _send_election_message(self, other_clock: int, other_id: str):
+        message = None
+        c = self.clock()
+        if other_id == None or ElectionProtocol.is_greater_than((c, self.id), (other_clock, other_id)):
+            message = json.dumps({"type": "ELECTION", "id": self.id, "clock": c}).encode()
         else:
-            id_to_send = other_id
-        message = json.dumps({"type": "ELECTION","id":id_to_send}).encode()
+            message = json.dumps({"type": "ELECTION", "id": other_id, "clock": other_clock}).encode()
         if self.neighbour_unknown:
             # we dont know where to send our messages yet, another instance will do it for us
             self.saved_messages.append(message)
@@ -53,7 +64,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
                 self.transport.sendto(message)
             logger.debug(f"sending {len(self.saved_messages)} buffered messsage")
         if self.participating:
-            self._send_election_message(None)
+            self._send_election_message(None, None)
 
     async def get_leader(self) -> str:
         while self.leader == None:
@@ -79,7 +90,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
 
         if incoming_id != self.id and self.election_message_received_callback != None:
             self.election_message_received_callback()
-
+        incoming_clock = message.get("clock") if message.get("clock") != None else 0
         if messageType == "ELECTION":
             logger.debug(f"got an incoming election message with id {incoming_id}")
             if incoming_id == self.id:
@@ -87,8 +98,8 @@ class ElectionProtocol(asyncio.DatagramProtocol):
                 leader_info = self.describable.describe()
                 leader_info["is_leader"] = True
                 self._handle_win((self.describable.host, leader_info))
-            elif not self.participating or incoming_id > self.id:
-                self._send_election_message(incoming_id)
+            elif not self.participating or ElectionProtocol.is_greater_than((incoming_clock, incoming_id),(self.clock(), self.id)):
+                self._send_election_message(incoming_clock, incoming_id)
         elif messageType == "VICTORY":
             leader_info = message["leader_info"]
             # using the self-reported "0.0.0.0" address leads to errors while replicating so we replace it once when it is seen
@@ -98,6 +109,8 @@ class ElectionProtocol(asyncio.DatagramProtocol):
     def register_election_message_received_callback(self, callback):
         self.election_message_received_callback = callback
 
+    def clock(self):
+        return self.describable.clock if self.describable.clock != None else 0
 class DiscoverabilityProtocol(asyncio.DatagramProtocol):
     def __init__(self, describable: Describable, group_ids: Optional[Set[str]] = None):
         self.describable = describable
