@@ -36,6 +36,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
         self.leader = None
         self.neighbour_unknown = neighbour_unknown
         self.saved_messages = saved_messages
+        self.election_message_received_callback = None
     
     def get_saved_messages(self) -> List[bytes]:
         if not self.neighbour_unknown:
@@ -74,7 +75,7 @@ class ElectionProtocol(asyncio.DatagramProtocol):
     def _handle_win(self, leader):
         leader_host, leader_info = leader
         leader_id = leader_info['id']
-        logger.info(f"Node {leader_id} won the election and is now the leader")
+        logger.info(f"Node {leader_id[0:5]} won the election and is now the leader")
         if self.leader == None:
             self.transport.sendto(json.dumps({"type": "VICTORY","id":leader_id, "leader_host":leader_host, "leader_info": leader_info}).encode())
             self.leader = leader
@@ -142,7 +143,7 @@ class DiscoverabilityProtocol(asyncio.DatagramProtocol):
         self.transport.sendto(msg, addr)
 
         # when used for ringbuilding we dont just want to discover, we also want to know the others
-        if self.q != None:
+        if self.q != None and req.get("info") != None:
             host, _ = addr
             self.q.put_nowait((host, req.get("info")))
     # necessary for ringbuilding
