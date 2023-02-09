@@ -385,8 +385,8 @@ class StorageNode:
             # how many messages are missing?
             clock_diff = self.clock - intro["clock"]
             assert(clock_diff >= 0) # if the difference is negative, the election must have gone wrong
-            self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=intro["clock"], missing=self.unstable[-clock_diff:])
-            logger.debug(f"unstable_clock={self.unstable_clock}, unstable={self.unstable}")
+            self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=intro["clock"], missing=[] if clock_diff == 0 else self.unstable[-clock_diff:])
+            logger.debug(f"unstable_clock={self.unstable_clock}, unstable={self.unstable}, own_clock={self.clock}, their_clock={intro['clock']}, diff={clock_diff}")
         else:
             self.groupview.add_candidate(id=intro["id"], host=peer[0], clock=self.clock)
             try:
